@@ -21,10 +21,21 @@ const BASE_URL: &str = "http://localhost:5000";
 mod metadata;
 use crate::metadata::Cache;
 
+mod nupkg;
+use crate::nupkg::Nupkg;
+
 static METADATA: OnceCell<Arc<RwLock<Cache>>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() {
+    match std::fs::create_dir("nupkgs") {
+        Ok(_) => (),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::AlreadyExists => (),
+            _ => panic!()
+        }
+    }
+
     let meta = METADATA.get_or_init(|| Arc::new(RwLock::new(Cache::default())));
 
     tokio::task::spawn_blocking(|| Cache::cache(meta)).await.unwrap();
@@ -65,7 +76,7 @@ async fn main() {
         .with(filters::compression::gzip());
 
     let package_base =
-        path!("nuget" / "v3" / "download" / String / "index.json")
+        path!("nuget" / "v3" / "base" / String / "index.json")
         .and(get().or(head()))
         .and_then(move |pkg: String, _| async move {
             let cache = METADATA.get().unwrap().read();
@@ -74,6 +85,15 @@ async fn main() {
             let res: WarpResult<_> = Ok(reply::json(&json!({
                 "versions": versions
             })));
+            res
+        });
+
+    let package_download =
+        path!("nuget" / "v3" / "base" / String / String / String)
+        .and_then(move |pkg, ver, _| async move {
+            let cache = METADATA.get().unwrap().read();
+            let nuget = cache.packages.get(&pkg).unwrap().items[0].items.iter().find(|x| x.catalogEntry.version == ver).unwrap();
+            let res: WarpResult<_> = Ok(reply::Response::new(Nupkg::get_for_pkg(nuget).into()));
             res
         });
 
@@ -106,6 +126,7 @@ async fn main() {
     let all =
         get_services
         .or(package_base)
+        .or(package_download)
         .or(reg_base)
         .or(search);
 

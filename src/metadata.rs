@@ -144,27 +144,29 @@ pub struct NugetVersionInner {
 
 impl From<TSPackage> for NugetPackage {
     fn from(pkg: TSPackage) -> Self {
+        let url = format!("{}/nuget/v3/package/{}/index.json", crate::BASE_URL, pkg.full_name.to_lowercase());
+
         NugetPackage {
-            id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
+            id: url.clone(),
             res_type: ["PackageRegistration".to_string(), "catalog:CatalogRoot".to_string(), "catalog:Permalink".to_string()],
             count: 1,
             items: [NugetPackageInner {
-                id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
+                id: url.clone(),
                 full_name: pkg.full_name.clone(),
                 count: pkg.versions.len(),
                 lower: pkg.versions.last().unwrap().version_number.clone(),
                 upper: pkg.versions.first().unwrap().version_number.clone(),
                 items: pkg.versions.into_iter().map(|version| {
                     NugetVersion {
-                        id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
-                        packageContent: "http://localhost:5000/some.nupkg".to_string(),
+                        id: url.clone(),
+                        packageContent: format!("{}/nuget/v3/base/{}/{}/{}.{}.nupkg", crate::BASE_URL, pkg.full_name.to_lowercase(), version.version_number, pkg.full_name.to_lowercase(), version.version_number),
                         catalogEntry: NugetVersionInner {
                             id: pkg.full_name.clone(),
                             description: version.description,
                             iconUrl: version.icon,
                             published: version.date_created,
+                            packageContent: format!("{}/nuget/v3/base/{}/{}/{}.{}.nupkg", crate::BASE_URL, pkg.full_name.to_lowercase(), version.version_number, pkg.full_name.to_lowercase(), version.version_number),
                             version: version.version_number,
-                            packageContent: "http://localhost:5000/some.nupkg".to_string(),
                             downloads: version.downloads,
                         }
                     }
