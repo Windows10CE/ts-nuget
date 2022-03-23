@@ -33,16 +33,24 @@ async fn main() {
 
     let get_services = 
         path!("nuget" / "v3" / "index.json")
-        .and(get())
-        .and_then(move || async move {
+        .and(get().or(head()))
+        .and_then(move |_| async move {
             let services = vec![
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/package"),
-                    res_type: "PackageBaseAddress/3.6.0".to_string(),
+                    id: format!("{BASE_URL}/nuget/v3/base"),
+                    res_type: "PackageBaseAddress/3.0.0".to_string(),
                 },
                 Resource {
                     id: format!("{BASE_URL}/nuget/v3/search"),
                     res_type: "SearchQueryService".to_string(),
+                },
+                Resource {
+                    id: format!("{BASE_URL}/nuget/v3/nullpublish"),
+                    res_type: "PackagePublish/2.0.0".to_string(),
+                },
+                Resource {
+                    id: format!("{BASE_URL}/nuget/v3/package"),
+                    res_type: "RegistrationsBaseUrl".to_string(),
                 },
             ];
 
@@ -53,11 +61,26 @@ async fn main() {
 
             let res: WarpResult<_> = Ok(reply::json(&json));
             res
-        });
+        })
+        .with(filters::compression::gzip());
 
     let package_base =
+        path!("nuget" / "v3" / "download" / String / "index.json")
+        .and(get().or(head()))
+        .and_then(move |pkg: String, _| async move {
+            let cache = METADATA.get().unwrap().read();
+            let versions: Vec<&str> = cache.packages.get(&pkg).unwrap().items[0].items.iter().map(|x| x.catalogEntry.version.as_str()).collect();
+
+            let res: WarpResult<_> = Ok(reply::json(&json!({
+                "versions": versions
+            })));
+            res
+        });
+
+    let reg_base =
         path!("nuget" / "v3" / "package" / String / "index.json")
-        .and_then(move |full_name: String| async move {
+        .and(get().or(head()))
+        .and_then(move |full_name: String, _| async move {
             let res: WarpResult<_>;
 
             let cache = METADATA.get().unwrap().read();
@@ -68,23 +91,25 @@ async fn main() {
                 res = Err(warp::reject::not_found());
             }
 
-            println!("{:#?}", full_name);
             res
         })
         .with(filters::compression::gzip());
 
     let search =
         path!("nuget" / "v3" / "search")
-        .and_then(move || async move {
+        .and(get().or(head()))
+        .and_then(move |_| async move {
             let res: WarpResult<_> = Ok(reply::json(&METADATA.get().unwrap().read().search(None)));
             res
-        })
-        .with(filters::compression::gzip());
+        });
 
     let all =
         get_services
         .or(package_base)
+        .or(reg_base)
         .or(search);
 
-    warp::serve(all).run(([0, 0, 0, 0], 5000)).await;
+    let logged = all.with(log::custom(|x| println!("{}: {}", x.method(), x.path())));
+
+    warp::serve(logged).run(([127, 0, 0, 1], 5000)).await;
 }

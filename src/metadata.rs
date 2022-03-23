@@ -104,6 +104,8 @@ pub struct TSVersion {
 pub struct NugetPackage {
     #[serde(rename = "@id")]
     pub id: String,
+    #[serde(rename = "@type")]
+    pub res_type: [String; 3],
     pub count: u8,
     pub items: [NugetPackageInner; 1]
 }
@@ -130,12 +132,12 @@ pub struct NugetVersion {
 
 #[derive(Serialize)]
 pub struct NugetVersionInner {
-    #[serde(rename = "@id")]
     pub id: String,
     pub description: String,
     pub iconUrl: String,
     pub published: String,
     pub version: String,
+    pub packageContent: String,
     #[serde(skip)]
     pub downloads: u32,
 }
@@ -143,24 +145,26 @@ pub struct NugetVersionInner {
 impl From<TSPackage> for NugetPackage {
     fn from(pkg: TSPackage) -> Self {
         NugetPackage {
-            id: "".to_string(),
+            id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
+            res_type: ["PackageRegistration".to_string(), "catalog:CatalogRoot".to_string(), "catalog:Permalink".to_string()],
             count: 1,
             items: [NugetPackageInner {
-                id: "".to_string(),
-                full_name: pkg.full_name,
+                id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
+                full_name: pkg.full_name.clone(),
                 count: pkg.versions.len(),
                 lower: pkg.versions.last().unwrap().version_number.clone(),
                 upper: pkg.versions.first().unwrap().version_number.clone(),
                 items: pkg.versions.into_iter().map(|version| {
                     NugetVersion {
-                        id: "".to_string(),
-                        packageContent: "".to_string(),
+                        id: "http://localhost:5000/nuget/v3/package/windows10ce-lunarscrap/index.json".to_string(),
+                        packageContent: "http://localhost:5000/some.nupkg".to_string(),
                         catalogEntry: NugetVersionInner {
-                            id: "".to_string(),
+                            id: pkg.full_name.clone(),
                             description: version.description,
                             iconUrl: version.icon,
                             published: version.date_created,
                             version: version.version_number,
+                            packageContent: "http://localhost:5000/some.nupkg".to_string(),
                             downloads: version.downloads,
                         }
                     }
