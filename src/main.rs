@@ -57,6 +57,14 @@ async fn main() {
                     res_type: "SearchQueryService".to_string(),
                 },
                 Resource {
+                    id: format!("{BASE_URL}/nuget/v3/search"),
+                    res_type: "SearchQueryService/3.0.0-beta".to_string(),
+                },
+                Resource {
+                    id: format!("{BASE_URL}/nuget/v3/search"),
+                    res_type: "SearchQueryService/3.0.0-rc".to_string(),
+                },
+                Resource {
                     id: format!("{BASE_URL}/nuget/v3/nullpublish"),
                     res_type: "PackagePublish/2.0.0".to_string(),
                 },
