@@ -64,11 +64,30 @@ impl Cache {
         cache.auto_update = None;
     }
 
-    pub fn search(&self, _q: Option<String>) -> SearchResult {
-        let results: Vec<_> = self.packages.values().map(|x| x.into()).collect();
+    pub fn search(&self, q: SearchQuery) -> SearchResult {
+        let results = self.packages.values().map(|x| x.into());
+
+        let mut final_vec: Vec<_> = match q.query {
+            Some(param) => {
+                let lowercase = param.to_lowercase();
+                results
+                    .filter(|x: &SearchItem| x.id.to_lowercase().contains(&lowercase))
+                    .collect()
+            }
+            None => results.collect(),
+        };
+
+        if let Some(skip) = q.skip {
+            final_vec = final_vec.into_iter().skip(skip).collect();
+        }
+
+        if let Some(take) = q.take {
+            final_vec = final_vec.into_iter().take(take).collect();
+        }
+
         SearchResult {
-            totalHits: results.len(),
-            data: results,
+            totalHits: final_vec.len(),
+            data: final_vec,
         }
     }
 }
@@ -80,6 +99,14 @@ impl Default for Cache {
             packages: HashMap::new(),
         }
     }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SearchQuery {
+    #[serde(rename = "q")]
+    pub query: Option<String>,
+    pub skip: Option<usize>,
+    pub take: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +128,7 @@ pub struct TSVersion {
     pub date_created: String,
     pub website_url: String,
     pub file_size: u64,
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -151,9 +179,10 @@ pub struct NugetVersionInner {
 
 impl From<TSPackage> for NugetPackage {
     fn from(pkg: TSPackage) -> Self {
+        let base_url = crate::BASE_URL.get().unwrap();
         let url = format!(
             "{}/nuget/v3/package/{}/index.json",
-            crate::BASE_URL,
+            base_url,
             pkg.full_name.to_lowercase()
         );
 
@@ -178,7 +207,7 @@ impl From<TSPackage> for NugetPackage {
                         id: url.clone(),
                         packageContent: format!(
                             "{}/nuget/v3/base/{}/{}/{}.{}.nupkg",
-                            crate::BASE_URL,
+                            base_url,
                             pkg.full_name.to_lowercase(),
                             version.version_number,
                             pkg.full_name.to_lowercase(),
@@ -186,12 +215,17 @@ impl From<TSPackage> for NugetPackage {
                         ),
                         catalogEntry: NugetVersionInner {
                             id: pkg.full_name.clone(),
-                            description: version.description,
+                            description: [format!("{}\n\nDepends on:", version.description)]
+                                .iter()
+                                .chain(&version.dependencies)
+                                .map(|x| x.as_str())
+                                .collect::<Vec<&str>>()
+                                .join("\n"),
                             iconUrl: version.icon,
                             published: version.date_created,
                             packageContent: format!(
                                 "{}/nuget/v3/base/{}/{}/{}.{}.nupkg",
-                                crate::BASE_URL,
+                                base_url,
                                 pkg.full_name.to_lowercase(),
                                 version.version_number,
                                 pkg.full_name.to_lowercase(),
@@ -209,14 +243,14 @@ impl From<TSPackage> for NugetPackage {
 }
 
 #[allow(non_snake_case)]
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct SearchResult {
     pub totalHits: usize,
     pub data: Vec<SearchItem>,
 }
 
 #[allow(non_snake_case)]
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct SearchItem {
     pub id: String,
     pub version: String,
@@ -236,14 +270,14 @@ impl From<&NugetPackage> for SearchItem {
             iconUrl: pkg.items[0].items[0].catalogEntry.iconUrl.clone(),
             registration: format!(
                 "{}/nuget/v3/package/{}/index.json",
-                crate::BASE_URL,
+                crate::BASE_URL.get().unwrap(),
                 pkg.items[0].full_name
             ),
         }
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct SearchVersion {
     #[serde(rename = "@id")]
     pub id: String,

@@ -2,13 +2,13 @@ use std::{sync::Arc, time::Duration};
 
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 use warp::*;
 
 type WarpResult<T> = Result<T, Rejection>;
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 struct Resource {
     #[serde(rename = "@id")]
     pub id: String,
@@ -16,10 +16,10 @@ struct Resource {
     pub res_type: String,
 }
 
-const BASE_URL: &str = "http://localhost:5000";
+static BASE_URL: OnceCell<String> = OnceCell::new();
 
 mod metadata;
-use crate::metadata::Cache;
+use crate::metadata::{Cache, SearchQuery};
 
 mod nupkg;
 use crate::nupkg::Nupkg;
@@ -28,6 +28,19 @@ static METADATA: OnceCell<Arc<RwLock<Cache>>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().unwrap();
+
+    BASE_URL
+        .set(std::env::var("NUGET_BASE_URL").expect("Needs NUGET_BASE_URL"))
+        .unwrap();
+    let port: u16 = match std::env::var("NUGET_PORT") {
+        Ok(port_str) => match port_str.parse() {
+            Ok(p) => p,
+            Err(_) => panic!("Couldn't parse port")
+        },
+        Err(_) => panic!("Needs NUGET_PORT"),
+    };
+
     match std::fs::create_dir("nupkgs") {
         Ok(_) => (),
         Err(e) => match e.kind() {
@@ -47,29 +60,30 @@ async fn main() {
     let get_services = path!("nuget" / "v3" / "index.json")
         .and(get().or(head()))
         .and_then(move |_| async move {
+            let url = BASE_URL.get().unwrap();
             let services = vec![
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/base"),
+                    id: format!("{url}/nuget/v3/base"),
                     res_type: "PackageBaseAddress/3.0.0".to_string(),
                 },
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/search"),
+                    id: format!("{url}/nuget/v3/search"),
                     res_type: "SearchQueryService".to_string(),
                 },
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/search"),
+                    id: format!("{url}/nuget/v3/search"),
                     res_type: "SearchQueryService/3.0.0-beta".to_string(),
                 },
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/search"),
+                    id: format!("{url}/nuget/v3/search"),
                     res_type: "SearchQueryService/3.0.0-rc".to_string(),
                 },
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/nullpublish"),
+                    id: format!("{url}/nuget/v3/nullpublish"),
                     res_type: "PackagePublish/2.0.0".to_string(),
                 },
                 Resource {
-                    id: format!("{BASE_URL}/nuget/v3/package"),
+                    id: format!("{url}/nuget/v3/package"),
                     res_type: "RegistrationsBaseUrl".to_string(),
                 },
             ];
@@ -137,8 +151,10 @@ async fn main() {
 
     let search = path!("nuget" / "v3" / "search")
         .and(get().or(head()))
-        .and_then(move |_| async move {
-            let res: WarpResult<_> = Ok(reply::json(&METADATA.get().unwrap().read().search(None)));
+        .and(query::<SearchQuery>())
+        .and_then(move |_, params: SearchQuery| async move {
+            let results = &METADATA.get().unwrap().read().search(params);
+            let res: WarpResult<_> = Ok(reply::json(&results));
             res
         });
 
@@ -148,9 +164,13 @@ async fn main() {
         .or(reg_base)
         .or(search);
 
-    let logged = all.with(log::custom(|x| println!("{}: {}", x.method(), x.path())));
+    #[cfg(debug_assertions)]
+    let final_filter = all.with(log::custom(|x| println!("{}: {}", x.method(), x.path())));
+
+    #[cfg(not(debug_assertions))]
+    let final_filter = all;
 
     println!("ready!");
 
-    warp::serve(logged).run(([127, 0, 0, 1], 5000)).await;
+    warp::serve(final_filter).run(([0, 0, 0, 0], port)).await;
 }
