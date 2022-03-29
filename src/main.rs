@@ -28,7 +28,7 @@ static METADATA: OnceCell<Arc<RwLock<Cache>>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() {
-    dotenv::dotenv().unwrap();
+    dotenv::dotenv().ok();
 
     BASE_URL
         .set(std::env::var("NUGET_BASE_URL").expect("Needs NUGET_BASE_URL"))
