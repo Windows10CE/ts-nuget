@@ -15,16 +15,25 @@ impl Cache {
 
         c.packages.clear();
 
-        let ts: Vec<TSPackage> = reqwest::blocking::get("https://thunderstore.io/api/v1/package/")
-            .unwrap()
-            .json()
-            .unwrap();
+        let ts: Vec<TSPackage> = include_str!("subdomains.txt")
+            .lines()
+            .flat_map(|subdomain| {
+                reqwest::blocking::get(format!(
+                    "https://{subdomain}thunderstore.io/api/v1/package/"
+                ))
+                .unwrap()
+                .json::<Vec<TSPackage>>()
+                .unwrap()
+            })
+            .collect();
 
         c.packages.shrink_to(ts.len());
 
         for package in ts {
-            c.packages
-                .insert(package.full_name.clone().to_lowercase(), package.into());
+            if !c.packages.contains_key(&package.full_name) {
+                c.packages
+                    .insert(package.full_name.clone().to_lowercase(), package.into());
+            }
         }
     }
 

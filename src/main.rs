@@ -36,7 +36,7 @@ async fn main() {
     let port: u16 = match std::env::var("NUGET_PORT") {
         Ok(port_str) => match port_str.parse() {
             Ok(p) => p,
-            Err(_) => panic!("Couldn't parse port")
+            Err(_) => panic!("Couldn't parse port"),
         },
         Err(_) => panic!("Needs NUGET_PORT"),
     };
@@ -55,7 +55,7 @@ async fn main() {
         .await
         .unwrap();
 
-    Cache::enable_auto_update(meta.clone(), Duration::from_secs(60)).await;
+    Cache::enable_auto_update(meta.clone(), Duration::from_secs(60 * 5)).await;
 
     let get_services = path!("nuget" / "v3" / "index.json")
         .and(get().or(head()))
