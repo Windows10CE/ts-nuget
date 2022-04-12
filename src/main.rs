@@ -53,7 +53,8 @@ async fn main() {
 
     tokio::task::spawn_blocking(|| Cache::cache(meta))
         .await
-        .unwrap();
+        .unwrap()
+        .expect("Failed to get initial cache!");
 
     Cache::enable_auto_update(meta.clone(), Duration::from_secs(60 * 5)).await;
 
@@ -120,14 +121,14 @@ async fn main() {
     let package_download = path!("nuget" / "v3" / "base" / String / String / String).and_then(
         move |pkg, ver, _| async move {
             let cache = METADATA.get().unwrap();
-            let nuget = cache.read().packages.get(&pkg).unwrap().items[0]
+            let nuget = cache.read().packages.get(&pkg).ok_or(reject::not_found())?.items[0]
                 .items
                 .iter()
                 .find(|x| x.catalogEntry.version == ver)
                 .unwrap()
                 .clone();
             let res: WarpResult<_> = Ok(reply::Response::new(
-                Nupkg::get_for_pkg(&nuget).await.into(),
+                Nupkg::get_for_pkg(&nuget).await.map_err(|_| reject::reject())?.into(),
             ));
             res
         },

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -10,22 +10,21 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn cache(cache: &RwLock<Cache>) {
+    pub fn cache(cache: &RwLock<Cache>) -> Result<(), reqwest::Error> {
         let mut c = cache.write();
 
         c.packages.clear();
 
-        let ts: Vec<TSPackage> = include_str!("subdomains.txt")
-            .lines()
-            .flat_map(|subdomain| {
-                reqwest::blocking::get(format!(
+        let mut ts: Vec<TSPackage> = Vec::new();
+
+        for subdomain in include_str!("subdomains.txt").lines() {
+            ts.append(
+                &mut reqwest::blocking::get(format!(
                     "https://{subdomain}thunderstore.io/api/v1/package/"
-                ))
-                .unwrap()
-                .json::<Vec<TSPackage>>()
-                .unwrap()
-            })
-            .collect();
+                ))?
+                .json::<Vec<TSPackage>>()?,
+            );
+        }
 
         c.packages.shrink_to(ts.len());
 
@@ -35,6 +34,8 @@ impl Cache {
                     .insert(package.full_name.clone().to_lowercase(), package.into());
             }
         }
+
+        Ok(())
     }
 
     pub async fn enable_auto_update(cache: Arc<RwLock<Cache>>, timeout: Duration) {
@@ -53,9 +54,18 @@ impl Cache {
                 }
 
                 let arc_inner = arc.clone();
-                tokio::task::spawn_blocking(move || Cache::cache(&arc_inner))
+                match tokio::task::spawn_blocking(move || Cache::cache(&arc_inner))
                     .await
-                    .unwrap();
+                    .unwrap()
+                {
+                    Ok(_) => (),
+                    Err(err) => writeln!(
+                        std::io::stderr(),
+                        "Unexpected error while updating cache! {:?}",
+                        err
+                    )
+                    .unwrap(),
+                }
             }
         });
 

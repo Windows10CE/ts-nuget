@@ -15,7 +15,7 @@ pub struct Nupkg {
 }
 
 impl Nupkg {
-    pub async fn get_for_pkg(pkg: &NugetVersion) -> Self {
+    pub async fn get_for_pkg(pkg: &NugetVersion) -> Result<Self, reqwest::Error> {
         let init_path = path::Path::new("nupkgs").join(format!(
             "{}.{}",
             pkg.catalogEntry.id, pkg.catalogEntry.version
@@ -25,11 +25,10 @@ impl Nupkg {
 
         if !path.exists() {
             let ts_bytes = reqwest::get(&pkg.catalogEntry.download_url)
-                .await
-                .unwrap()
+                .await?
                 .bytes()
-                .await
-                .unwrap();
+                .await?;
+
             let mut zip_file = tokio::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -89,7 +88,7 @@ impl Nupkg {
             tokio::fs::remove_file(zip_path).await.unwrap();
         }
 
-        Self { path }
+        Ok(Self { path })
     }
 }
 
