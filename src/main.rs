@@ -4,7 +4,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::json;
-use warp::*;
+use warp::{*, http::Response};
 
 type WarpResult<T> = Result<T, Rejection>;
 
@@ -51,10 +51,12 @@ async fn main() {
 
     let meta = METADATA.get_or_init(|| Arc::new(RwLock::new(Cache::default())));
 
-    tokio::task::spawn_blocking(|| Cache::cache(meta))
-        .await
-        .unwrap()
-        .expect("Failed to get initial cache!");
+    let start = std::time::Instant::now();
+    Cache::cache(meta).await.expect("");
+    println!(
+        "Took {} seconds to get the full cache",
+        start.elapsed().as_secs_f64()
+    );
 
     Cache::enable_auto_update(meta.clone(), Duration::from_secs(60 * 5)).await;
 
@@ -121,14 +123,22 @@ async fn main() {
     let package_download = path!("nuget" / "v3" / "base" / String / String / String).and_then(
         move |pkg, ver, _| async move {
             let cache = METADATA.get().unwrap();
-            let nuget = cache.read().packages.get(&pkg).ok_or(reject::not_found())?.items[0]
+            let nuget = cache
+                .read()
+                .packages
+                .get(&pkg)
+                .ok_or(reject::not_found())?
+                .items[0]
                 .items
                 .iter()
                 .find(|x| x.catalogEntry.version == ver)
-                .unwrap()
+                .ok_or(reject::not_found())?
                 .clone();
             let res: WarpResult<_> = Ok(reply::Response::new(
-                Nupkg::get_for_pkg(&nuget).await.map_err(|_| reject::reject())?.into(),
+                Nupkg::get_for_pkg(&nuget)
+                    .await
+                    .map_err(|_| reject::reject())?
+                    .into(),
             ));
             res
         },
@@ -143,7 +153,7 @@ async fn main() {
             if let Some(pkg) = cache.packages.get(&full_name.to_lowercase()) {
                 res = Ok(reply::json(pkg))
             } else {
-                res = Err(warp::reject::not_found());
+                res = Err(reject::not_found());
             }
 
             res
@@ -154,10 +164,15 @@ async fn main() {
         .and(get().or(head()))
         .and(query::<SearchQuery>())
         .and_then(move |_, params: SearchQuery| async move {
-            let results = &METADATA.get().unwrap().read().search(params);
-            let res: WarpResult<_> = Ok(reply::json(&results));
+            let meta = &METADATA.get().unwrap().read();
+            let res: WarpResult<_> = if params.query.is_none() && params.skip.is_none() && params.take.is_none() {
+                Ok(Response::builder().header("content-type", "application/json").body(meta.all_packages.as_ref().unwrap().clone()).unwrap())
+            } else {
+                Ok(Response::builder().header("content-type", "application/json").body(serde_json::to_string(&meta.search(params)).unwrap()).unwrap())
+            };
             res
-        });
+        })
+        .with(filters::compression::gzip());
 
     let all = get_services
         .or(package_base)

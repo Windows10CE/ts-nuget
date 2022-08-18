@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
+use futures::StreamExt;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -7,35 +8,67 @@ use tokio_util::sync::CancellationToken;
 pub struct Cache {
     auto_update: Option<Arc<CancellationToken>>,
     pub packages: HashMap<String, NugetPackage>,
+    pub all_packages: Option<String>,
 }
 
 impl Cache {
-    pub fn cache(cache: &RwLock<Cache>) -> Result<(), reqwest::Error> {
-        let mut c = cache.write();
+    pub async fn cache(cache: &RwLock<Cache>) -> Result<(), reqwest::Error> {
+        let mut next_option =
+            Some("https://thunderstore.io/api/experimental/community/".to_string());
+        let mut communities = vec![];
 
-        c.packages.clear();
-
-        let mut ts: Vec<TSPackage> = Vec::new();
-
-        for subdomain in include_str!("subdomains.txt").lines() {
-            ts.append(
-                &mut reqwest::blocking::get(format!(
-                    "https://{subdomain}thunderstore.io/api/v1/package/"
-                ))?
-                .json::<Vec<TSPackage>>()?,
-            );
+        while let Some(next) = next_option {
+            let list = reqwest::get(next).await?.json::<TSCommunityList>().await?;
+            communities.extend(list.results.into_iter().map(|x| x.identifier));
+            next_option = list.pagination.next_link;
         }
 
-        c.packages.shrink_to(ts.len());
+        let packages = communities
+            .into_iter()
+            .map(|comm| async move {
+                Ok(
+                    reqwest::get(format!("https://thunderstore.io/c/{comm}/api/v1/package/"))
+                        .await?
+                        .json::<Vec<TSPackage>>()
+                        .await?,
+                )
+            })
+            .collect::<futures::stream::FuturesUnordered<_>>()
+            .collect::<Vec<Result<Vec<TSPackage>, reqwest::Error>>>()
+            .await;
 
-        for package in ts {
-            if !c.packages.contains_key(&package.full_name) {
-                c.packages
+        if packages.iter().any(|res| res.is_err()) {
+            return Err(packages
+                .into_iter()
+                .find(|res| res.is_err())
+                .unwrap()
+                .err()
+                .unwrap());
+        }
+
+        cache
+            .write()
+            .replace_with(packages.into_iter().flat_map(|res| res.unwrap()).collect());
+
+        Ok(())
+    }
+
+    fn replace_with(&mut self, ts_packages: Vec<TSPackage>) {
+        self.packages.clear();
+
+        self.packages.shrink_to(ts_packages.len());
+
+        for package in ts_packages {
+            if !self.packages.contains_key(&package.full_name) {
+                self.packages
                     .insert(package.full_name.clone().to_lowercase(), package.into());
             }
         }
 
-        Ok(())
+        self.all_packages = Some(serde_json::to_string(&SearchResult {
+            totalHits: self.packages.len(),
+            data: self.packages.values().map(|p| p.into()).collect(),
+        }).unwrap());
     }
 
     pub async fn enable_auto_update(cache: Arc<RwLock<Cache>>, timeout: Duration) {
@@ -54,10 +87,7 @@ impl Cache {
                 }
 
                 let arc_inner = arc.clone();
-                match tokio::task::spawn_blocking(move || Cache::cache(&arc_inner))
-                    .await
-                    .unwrap()
-                {
+                match Cache::cache(&arc_inner).await {
                     Ok(_) => (),
                     Err(err) => writeln!(
                         std::io::stderr(),
@@ -116,6 +146,7 @@ impl Default for Cache {
         Cache {
             auto_update: None,
             packages: HashMap::new(),
+            all_packages: None,
         }
     }
 }
@@ -126,6 +157,22 @@ pub struct SearchQuery {
     pub query: Option<String>,
     pub skip: Option<usize>,
     pub take: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct Pagination {
+    pub next_link: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct TSCommunity {
+    pub identifier: String,
+}
+
+#[derive(Deserialize)]
+pub struct TSCommunityList {
+    pub pagination: Pagination,
+    pub results: Vec<TSCommunity>,
 }
 
 #[derive(Deserialize)]
