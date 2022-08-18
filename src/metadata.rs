@@ -65,10 +65,13 @@ impl Cache {
             }
         }
 
-        self.all_packages = Some(serde_json::to_string(&SearchResult {
-            totalHits: self.packages.len(),
-            data: self.packages.values().map(|p| p.into()).collect(),
-        }).unwrap());
+        self.all_packages = Some(
+            serde_json::to_string(&SearchResult {
+                totalHits: self.packages.len(),
+                data: self.packages.values().map(|p| p.into()).collect(),
+            })
+            .unwrap(),
+        );
     }
 
     pub async fn enable_auto_update(cache: Arc<RwLock<Cache>>, timeout: Duration) {

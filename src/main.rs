@@ -4,7 +4,7 @@ use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::json;
-use warp::{*, http::Response};
+use warp::{http::Response, *};
 
 type WarpResult<T> = Result<T, Rejection>;
 
@@ -165,11 +165,18 @@ async fn main() {
         .and(query::<SearchQuery>())
         .and_then(move |_, params: SearchQuery| async move {
             let meta = &METADATA.get().unwrap().read();
-            let res: WarpResult<_> = if params.query.is_none() && params.skip.is_none() && params.take.is_none() {
-                Ok(Response::builder().header("content-type", "application/json").body(meta.all_packages.as_ref().unwrap().clone()).unwrap())
-            } else {
-                Ok(Response::builder().header("content-type", "application/json").body(serde_json::to_string(&meta.search(params)).unwrap()).unwrap())
-            };
+            let res: WarpResult<_> =
+                if params.query.is_none() && params.skip.is_none() && params.take.is_none() {
+                    Ok(Response::builder()
+                        .header("content-type", "application/json")
+                        .body(meta.all_packages.as_ref().unwrap().clone())
+                        .unwrap())
+                } else {
+                    Ok(Response::builder()
+                        .header("content-type", "application/json")
+                        .body(serde_json::to_string(&meta.search(params)).unwrap())
+                        .unwrap())
+                };
             res
         })
         .with(filters::compression::gzip());
