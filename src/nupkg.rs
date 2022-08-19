@@ -16,12 +16,13 @@ pub struct Nupkg {
 
 impl Nupkg {
     pub async fn get_for_pkg(pkg: &NugetVersion) -> Result<Self, reqwest::Error> {
-        let init_path = path::Path::new("nupkgs").join(format!(
+        let name = format!(
             "{}.{}",
             pkg.catalogEntry.id, pkg.catalogEntry.version
-        ));
-        let path = init_path.with_extension("nupkg");
-        let zip_path = init_path.with_extension("zip");
+        );
+        let init_path = path::Path::new("nupkgs");
+        let path = init_path.join(name.clone() + ".nupkg");
+        let zip_path = init_path.join(name + ".zip");
 
         if !path.exists() {
             let ts_bytes = reqwest::get(&pkg.catalogEntry.download_url)
