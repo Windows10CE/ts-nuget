@@ -1,10 +1,11 @@
-use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::StreamExt;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Default)]
 pub struct Cache {
     auto_update: Option<Arc<CancellationToken>>,
     pub packages: HashMap<String, NugetPackage>,
@@ -26,12 +27,10 @@ impl Cache {
         let packages = communities
             .into_iter()
             .map(|comm| async move {
-                Ok(
-                    reqwest::get(format!("https://thunderstore.io/c/{comm}/api/v1/package/"))
-                        .await?
-                        .json::<Vec<TSPackage>>()
-                        .await?,
-                )
+                reqwest::get(format!("https://thunderstore.io/c/{comm}/api/v1/package/"))
+                    .await?
+                    .json::<Vec<TSPackage>>()
+                    .await
             })
             .collect::<futures::stream::FuturesUnordered<_>>()
             .collect::<Vec<Result<Vec<TSPackage>, reqwest::Error>>>()
@@ -48,6 +47,7 @@ impl Cache {
 
         cache
             .write()
+            .await
             .replace_with(packages.into_iter().flat_map(|res| res.unwrap()).collect());
 
         Ok(())
@@ -75,7 +75,7 @@ impl Cache {
     }
 
     pub async fn enable_auto_update(cache: Arc<RwLock<Cache>>, timeout: Duration) {
-        let mut s = cache.write();
+        let mut s = cache.write().await;
 
         Cache::disable_auto_update(&mut s);
 
@@ -92,12 +92,7 @@ impl Cache {
                 let arc_inner = arc.clone();
                 match Cache::cache(&arc_inner).await {
                     Ok(_) => (),
-                    Err(err) => writeln!(
-                        std::io::stderr(),
-                        "Unexpected error while updating cache! {:?}",
-                        err
-                    )
-                    .unwrap(),
+                    Err(err) => eprintln!("Unexpected error while updating cache! {err:?}"),
                 }
             }
         });
@@ -140,16 +135,6 @@ impl Cache {
         SearchResult {
             totalHits: final_vec.len(),
             data: final_vec,
-        }
-    }
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Cache {
-            auto_update: None,
-            packages: HashMap::new(),
-            all_packages: None,
         }
     }
 }

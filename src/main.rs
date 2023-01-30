@@ -1,12 +1,15 @@
+use std::net::SocketAddr;
 use std::{sync::Arc, time::Duration};
 
 use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
 use serde::Serialize;
-use serde_json::json;
-use warp::{http::Response, *};
+use serde_json::{json, Value};
+use tokio::{sync::RwLock, time::Instant};
 
-type WarpResult<T> = Result<T, Rejection>;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Json};
+use axum::Router;
 
 #[derive(Serialize)]
 struct Resource {
@@ -19,12 +22,14 @@ struct Resource {
 static BASE_URL: OnceCell<String> = OnceCell::new();
 
 mod metadata;
+
 use crate::metadata::{Cache, SearchQuery};
 
 mod nupkg;
+
 use crate::nupkg::Nupkg;
 
-static METADATA: OnceCell<Arc<RwLock<Cache>>> = OnceCell::new();
+type SharedState = Arc<RwLock<Cache>>;
 
 #[tokio::main]
 async fn main() {
@@ -49,151 +54,149 @@ async fn main() {
         },
     }
 
-    let meta = METADATA.get_or_init(|| Arc::new(RwLock::new(Cache::default())));
+    let shared_state: SharedState = Default::default();
 
-    let start = std::time::Instant::now();
-    Cache::cache(meta).await.expect("");
+    let cache_start = Instant::now();
+    Cache::cache(&shared_state)
+        .await
+        .expect("Failed to get cache");
     println!(
-        "Took {} seconds to get the full cache",
-        start.elapsed().as_secs_f64()
+        "Took {} seconds to get full cache",
+        cache_start.elapsed().as_secs_f64()
     );
 
-    Cache::enable_auto_update(meta.clone(), Duration::from_secs(60 * 5)).await;
+    Cache::enable_auto_update(shared_state.clone(), Duration::from_secs(60 * 5)).await;
 
-    let get_services = path!("nuget" / "v3" / "index.json")
-        .and(get().or(head()))
-        .and_then(move |_| async move {
-            let url = BASE_URL.get().unwrap();
-            let services = vec![
-                Resource {
-                    id: format!("{url}/nuget/v3/base"),
-                    res_type: "PackageBaseAddress/3.0.0".to_string(),
-                },
-                Resource {
-                    id: format!("{url}/nuget/v3/search"),
-                    res_type: "SearchQueryService".to_string(),
-                },
-                Resource {
-                    id: format!("{url}/nuget/v3/search"),
-                    res_type: "SearchQueryService/3.0.0-beta".to_string(),
-                },
-                Resource {
-                    id: format!("{url}/nuget/v3/search"),
-                    res_type: "SearchQueryService/3.0.0-rc".to_string(),
-                },
-                Resource {
-                    id: format!("{url}/nuget/v3/nullpublish"),
-                    res_type: "PackagePublish/2.0.0".to_string(),
-                },
-                Resource {
-                    id: format!("{url}/nuget/v3/package"),
-                    res_type: "RegistrationsBaseUrl".to_string(),
-                },
-            ];
+    let app = Router::new()
+        .route("/nuget/v3/index.json", axum::routing::get(get_services))
+        .route(
+            "/nuget/v3/base/:id/index.json",
+            axum::routing::get(get_base),
+        )
+        .route(
+            "/nuget/v3/base/:id/:ver/:filename",
+            axum::routing::get(get_download),
+        )
+        .route(
+            "/nuget/v3/package/:id/index.json",
+            axum::routing::get(get_registry),
+        )
+        .route("/nuget/v3/search", axum::routing::get(search))
+        .layer(tower_http::compression::CompressionLayer::new())
+        .with_state(shared_state);
 
-            let json = json!({
-                "version": "3.0.0",
-                "resources": services,
-            });
+    axum::Server::bind(&SocketAddr::from(([0, 0, 0, 0], port)))
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+}
 
-            let res: WarpResult<_> = Ok(reply::json(&json));
-            res
-        })
-        .with(filters::compression::gzip());
+async fn get_services() -> Json<Value> {
+    let url = BASE_URL.get().unwrap();
 
-    let package_base = path!("nuget" / "v3" / "base" / String / "index.json")
-        .and(get().or(head()))
-        .and_then(move |pkg: String, _| async move {
-            let cache = METADATA.get().unwrap().read();
-            let res: WarpResult<_> = match cache.packages.get(&pkg.to_lowercase()) {
-                Some(pkg) => {
-                    let versions: Vec<&str> = pkg.items[0]
-                        .items
-                        .iter()
-                        .map(|x| x.catalogEntry.version.as_str())
-                        .collect();
-                    Ok(reply::json(&json!({ "versions": versions })))
-                }
-                None => Err(reject::not_found()),
-            };
+    let resources = [
+        Resource {
+            id: format!("{url}/nuget/v3/base"),
+            res_type: "PackageBaseAddress/3.0.0".to_string(),
+        },
+        Resource {
+            id: format!("{url}/nuget/v3/search"),
+            res_type: "SearchQueryService".to_string(),
+        },
+        Resource {
+            id: format!("{url}/nuget/v3/search"),
+            res_type: "SearchQueryService/3.0.0-beta".to_string(),
+        },
+        Resource {
+            id: format!("{url}/nuget/v3/search"),
+            res_type: "SearchQueryService/3.0.0-rc".to_string(),
+        },
+        Resource {
+            id: format!("{url}/nuget/v3/nullpublish"),
+            res_type: "PackagePublish/2.0.0".to_string(),
+        },
+        Resource {
+            id: format!("{url}/nuget/v3/package"),
+            res_type: "RegistrationsBaseUrl".to_string(),
+        },
+    ];
 
-            res
-        });
+    Json(json!({
+        "version": "3.0.0",
+        "resources": resources,
+    }))
+}
 
-    let package_download = path!("nuget" / "v3" / "base" / String / String / String).and_then(
-        move |pkg, ver, _| async move {
-            let cache = METADATA.get().unwrap();
-            let nuget = cache
-                .read()
-                .packages
-                .get(&pkg)
-                .ok_or(reject::not_found())?
-                .items[0]
+async fn get_base(
+    Path(id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, StatusCode> {
+    let cache = state.read().await;
+
+    cache
+        .packages
+        .get(&id.to_lowercase())
+        .map(|package| {
+            let versions = package.items[0]
                 .items
                 .iter()
-                .find(|x| x.catalogEntry.version == ver)
-                .ok_or(reject::not_found())?
-                .clone();
-            let res: WarpResult<_> = Ok(reply::Response::new(
-                Nupkg::get_for_pkg(&nuget)
-                    .await
-                    .map_err(|_| reject::reject())?
-                    .into(),
-            ));
-            res
-        },
-    );
-
-    let reg_base = path!("nuget" / "v3" / "package" / String / "index.json")
-        .and(get().or(head()))
-        .and_then(move |full_name: String, _| async move {
-            let res: WarpResult<_>;
-
-            let cache = METADATA.get().unwrap().read();
-            if let Some(pkg) = cache.packages.get(&full_name.to_lowercase()) {
-                res = Ok(reply::json(pkg))
-            } else {
-                res = Err(reject::not_found());
-            }
-
-            res
+                .map(|version| version.catalogEntry.version.as_str())
+                .collect::<Vec<_>>();
+            Json(json!({ "versions": versions }))
         })
-        .with(filters::compression::gzip());
+        .ok_or(StatusCode::NOT_FOUND)
+}
 
-    let search = path!("nuget" / "v3" / "search")
-        .and(get().or(head()))
-        .and(query::<SearchQuery>())
-        .and_then(move |_, params: SearchQuery| async move {
-            let meta = &METADATA.get().unwrap().read();
-            let res: WarpResult<_> =
-                if params.query.is_none() && params.skip.is_none() && params.take.is_none() {
-                    Ok(Response::builder()
-                        .header("content-type", "application/json")
-                        .body(meta.all_packages.as_ref().unwrap().clone())
-                        .unwrap())
-                } else {
-                    Ok(Response::builder()
-                        .header("content-type", "application/json")
-                        .body(serde_json::to_string(&meta.search(params)).unwrap())
-                        .unwrap())
-                };
-            res
+async fn get_download(
+    Path((id, ver)): Path<(String, String)>,
+    State(state): State<SharedState>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let version = state.read().await
+        .packages
+        .get(&id.to_lowercase())
+        .and_then(|pkg| {
+            pkg.items[0]
+                .items
+                .iter()
+                .find(|nuget_ver| nuget_ver.catalogEntry.version == ver)
         })
-        .with(filters::compression::gzip());
+        .ok_or(StatusCode::NOT_FOUND)?
+        .clone();
 
-    let all = get_services
-        .or(package_base)
-        .or(package_download)
-        .or(reg_base)
-        .or(search);
+    Ok(Nupkg::get_for_pkg(&version)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .get_body()
+        .await)
+}
 
-    #[cfg(debug_assertions)]
-    let final_filter = all.with(log::custom(|x| println!("{}: {}", x.method(), x.path())));
+async fn get_registry(
+    Path(id): Path<String>,
+    State(state): State<SharedState>,
+) -> Result<Json<Value>, StatusCode> {
+    let cache = state.read().await;
 
-    #[cfg(not(debug_assertions))]
-    let final_filter = all;
+    cache
+        .packages
+        .get(&id.to_lowercase())
+        .map(|pkg| Json(serde_json::to_value(pkg).unwrap()))
+        .ok_or(StatusCode::NOT_FOUND)
+}
 
-    println!("ready!");
+async fn search(
+    Query(params): Query<SearchQuery>,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    let cache = state.read().await;
 
-    warp::serve(final_filter).run(([0, 0, 0, 0], port)).await;
+    let data = if matches!(
+        (&params.query, &params.skip, &params.take),
+        (&None, &None, &None)
+    ) {
+        cache.all_packages.as_ref().unwrap().to_string()
+    } else {
+        serde_json::to_string(&cache.search(params)).unwrap()
+    };
+
+    ([(header::CONTENT_TYPE, "application/json")], data)
 }

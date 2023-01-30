@@ -1,11 +1,13 @@
 use std::{
-    fs::File,
     io::{Read, Write},
     path::{self, Path, PathBuf},
 };
+use axum::body::StreamBody;
+use axum::response::IntoResponse;
 
-use hyper::Body;
+use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 use crate::metadata::NugetVersion;
@@ -16,10 +18,7 @@ pub struct Nupkg {
 
 impl Nupkg {
     pub async fn get_for_pkg(pkg: &NugetVersion) -> Result<Self, reqwest::Error> {
-        let name = format!(
-            "{}.{}",
-            pkg.catalogEntry.id, pkg.catalogEntry.version
-        );
+        let name = format!("{}.{}", pkg.catalogEntry.id, pkg.catalogEntry.version);
         let init_path = path::Path::new("nupkgs");
         let path = init_path.join(name.clone() + ".nupkg");
         let zip_path = init_path.join(name + ".zip");
@@ -91,15 +90,8 @@ impl Nupkg {
 
         Ok(Self { path })
     }
-}
 
-impl Into<Body> for Nupkg {
-    fn into(self) -> Body {
-        File::open(self.path)
-            .unwrap()
-            .bytes()
-            .filter_map(|x| x.ok())
-            .collect::<Vec<u8>>()
-            .into()
+    pub async fn get_body(&self) -> impl IntoResponse {
+        StreamBody::new(ReaderStream::new(File::open(&self.path).await.unwrap()))
     }
 }

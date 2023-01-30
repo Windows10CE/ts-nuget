@@ -1,3 +1,4 @@
 /target
 nupkgs/
 .env
+.idea/
