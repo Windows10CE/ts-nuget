@@ -151,7 +151,9 @@ async fn get_download(
     Path((id, ver)): Path<(String, String)>,
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let version = state.read().await
+    let version = state
+        .read()
+        .await
         .packages
         .get(&id.to_lowercase())
         .and_then(|pkg| {
@@ -163,11 +165,13 @@ async fn get_download(
         .ok_or(StatusCode::NOT_FOUND)?
         .clone();
 
-    Ok(Nupkg::get_for_pkg(&version)
+    let response = Nupkg::get_for_pkg(&version)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .get_body()
-        .await)
+        .await;
+
+    Ok(([("Cache-Control", "max-age=1209600, immutable")], response))
 }
 
 async fn get_registry(

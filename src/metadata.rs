@@ -89,8 +89,7 @@ impl Cache {
                     return;
                 }
 
-                let arc_inner = arc.clone();
-                match Cache::cache(&arc_inner).await {
+                match Cache::cache(&arc).await {
                     Ok(_) => (),
                     Err(err) => eprintln!("Unexpected error while updating cache! {err:?}"),
                 }
