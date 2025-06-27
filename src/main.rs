@@ -1,15 +1,15 @@
-use std::net::SocketAddr;
-use std::{sync::Arc, time::Duration};
-
-use once_cell::sync::OnceCell;
+use axum::body::Bytes;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::OnceLock;
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::RwLock, time::Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
+use tokio::net::TcpListener;
 
 #[derive(Serialize)]
 struct Resource {
@@ -19,17 +19,19 @@ struct Resource {
     pub res_type: String,
 }
 
-static BASE_URL: OnceCell<String> = OnceCell::new();
+static BASE_URL: OnceLock<String> = OnceLock::new();
 
 mod metadata;
 
-use crate::metadata::{Cache, SearchQuery};
+use crate::metadata::{Cache, PackageKey, SearchQuery};
 
 mod nupkg;
 
 use crate::nupkg::Nupkg;
 
 type SharedState = Arc<RwLock<Cache>>;
+
+const DEFAULT_CACHE: Duration = Duration::from_secs(5 * 60);
 
 #[tokio::main]
 async fn main() {
@@ -65,30 +67,38 @@ async fn main() {
         cache_start.elapsed().as_secs_f64()
     );
 
-    Cache::enable_auto_update(shared_state.clone(), Duration::from_secs(60 * 5)).await;
+    Cache::enable_auto_update(shared_state.clone(), DEFAULT_CACHE).await;
 
     let app = Router::new()
         .route("/nuget/v3/index.json", axum::routing::get(get_services))
         .route(
-            "/nuget/v3/base/:id/index.json",
+            "/nuget/v3/base/{id}/index.json",
             axum::routing::get(get_base),
         )
         .route(
-            "/nuget/v3/base/:id/:ver/:filename",
+            "/nuget/v3/base/{id}/{ver}/{filename}",
             axum::routing::get(get_download),
         )
         .route(
-            "/nuget/v3/package/:id/index.json",
+            "/nuget/v3/package/{id}/index.json",
             axum::routing::get(get_registry),
         )
         .route("/nuget/v3/search", axum::routing::get(search))
         .layer(tower_http::compression::CompressionLayer::new())
-        .with_state(shared_state);
+        .with_state(shared_state.clone());
 
-    axum::Server::bind(&SocketAddr::from(([0, 0, 0, 0], port)))
-        .serve(app.into_make_service())
+    let rt = tokio::runtime::Handle::current();
+
+    std::thread::spawn(move || {
+        for _ in std::io::stdin().lines() {
+            rt.block_on(Cache::cache(&shared_state)).unwrap();
+            println!("forced cache refresh");
+        }
+    });
+
+    axum::serve(TcpListener::bind(("0.0.0.0", port)).await.unwrap(), app)
         .await
-        .unwrap();
+        .unwrap()
 }
 
 async fn get_services() -> Json<Value> {
@@ -130,32 +140,41 @@ async fn get_services() -> Json<Value> {
 async fn get_base(
     Path(id): Path<String>,
     State(state): State<SharedState>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     let cache = state.read().await;
 
     cache
         .packages
-        .get(&id.to_lowercase())
+        .get(&PackageKey::try_from(id).map_err(|_| StatusCode::BAD_REQUEST)?)
         .map(|package| {
             let versions = package.items[0]
                 .items
                 .iter()
                 .map(|version| version.catalogEntry.version.as_str())
                 .collect::<Vec<_>>();
-            Json(json!({ "versions": versions }))
+            (
+                [(
+                    "Cache-Control",
+                    format!(
+                        "max-age={}",
+                        cache.cache_duration.unwrap_or(DEFAULT_CACHE).as_secs() / 2
+                    ),
+                )],
+                Json(json!({ "versions": versions })),
+            )
         })
         .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn get_download(
-    Path((id, ver)): Path<(String, String)>,
+    Path((id, ver, _)): Path<(String, String, ())>,
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let version = state
         .read()
         .await
         .packages
-        .get(&id.to_lowercase())
+        .get(&PackageKey::try_from(id).map_err(|_| StatusCode::BAD_REQUEST)?)
         .and_then(|pkg| {
             pkg.items[0]
                 .items
@@ -177,14 +196,41 @@ async fn get_download(
 async fn get_registry(
     Path(id): Path<String>,
     State(state): State<SharedState>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<impl IntoResponse, StatusCode> {
     let cache = state.read().await;
 
     cache
         .packages
-        .get(&id.to_lowercase())
-        .map(|pkg| Json(serde_json::to_value(pkg).unwrap()))
+        .get(&PackageKey::try_from(id).map_err(|_| StatusCode::BAD_REQUEST)?)
+        .map(|pkg| {
+            (
+                [(
+                    "Cache-Control",
+                    format!(
+                        "max-age={}",
+                        cache.cache_duration.unwrap_or(DEFAULT_CACHE).as_secs() / 2
+                    ),
+                )],
+                Json(serde_json::to_value(pkg).unwrap()),
+            )
+        })
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+enum SearchResponse {
+    All(Bytes),
+    Query(Json<metadata::SearchResult>),
+}
+
+impl IntoResponse for SearchResponse {
+    fn into_response(self) -> Response {
+        match self {
+            SearchResponse::All(all) => {
+                ([(header::CONTENT_TYPE, "application/json")], all).into_response()
+            }
+            SearchResponse::Query(query) => query.into_response(),
+        }
+    }
 }
 
 async fn search(
@@ -193,14 +239,27 @@ async fn search(
 ) -> impl IntoResponse {
     let cache = state.read().await;
 
-    let data = if matches!(
-        (&params.query, &params.skip, &params.take),
-        (&None, &None, &None)
+    let body = if matches!(
+        params,
+        SearchQuery {
+            query: None,
+            skip: None,
+            take: None
+        }
     ) {
-        cache.all_packages.as_ref().unwrap().to_string()
+        SearchResponse::All(cache.all_packages.clone())
     } else {
-        serde_json::to_string(&cache.search(params)).unwrap()
+        SearchResponse::Query(Json(cache.search(params)))
     };
 
-    ([(header::CONTENT_TYPE, "application/json")], data)
+    (
+        [(
+            "Cache-Control",
+            format!(
+                "max-age={}",
+                cache.cache_duration.unwrap_or(DEFAULT_CACHE).as_secs() / 2
+            ),
+        )],
+        body,
+    )
 }

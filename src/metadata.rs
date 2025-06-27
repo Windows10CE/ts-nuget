@@ -1,15 +1,70 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
-use futures::StreamExt;
+use axum::body::Bytes;
+use futures::{pin_mut, FutureExt};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+mod key {
+    use std::borrow::Cow;
+    use std::hash::Hash;
+    use thiserror::Error;
+
+    pub struct PackageKey<'a>(Cow<'a, str>);
+    #[derive(Error, Debug, Clone)]
+    #[error("Package name was not ASCII; {0}")]
+    pub struct NonAsciiError<'a>(Cow<'a, str>);
+
+    impl<'a> TryFrom<&'a str> for PackageKey<'a> {
+        type Error = NonAsciiError<'a>;
+
+        fn try_from(value: &'a str) -> Result<Self, Self::Error> {
+            if value.is_ascii() {
+                Ok(Self(Cow::Borrowed(value)))
+            } else {
+                Err(NonAsciiError(Cow::Borrowed(value)))
+            }
+        }
+    }
+
+    impl TryFrom<String> for PackageKey<'_> {
+        type Error = NonAsciiError<'static>;
+
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            if value.is_ascii() {
+                Ok(Self(Cow::Owned(value)))
+            } else {
+                Err(NonAsciiError(Cow::Owned(value)))
+            }
+        }
+    }
+
+    impl Hash for PackageKey<'_> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            for b in self.0.as_bytes() {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+            state.write_u8(0xff);
+        }
+    }
+
+    impl PartialEq<PackageKey<'_>> for PackageKey<'_> {
+        fn eq(&self, other: &PackageKey<'_>) -> bool {
+            self.0.eq_ignore_ascii_case(&other.0)
+        }
+    }
+
+    impl Eq for PackageKey<'_> {}
+}
+
+pub use key::*;
 
 #[derive(Default)]
 pub struct Cache {
     auto_update: Option<Arc<CancellationToken>>,
-    pub packages: HashMap<String, NugetPackage>,
-    pub all_packages: Option<String>,
+    pub cache_duration: Option<Duration>,
+    pub packages: HashMap<PackageKey<'static>, NugetPackage>,
+    pub all_packages: Bytes,
 }
 
 impl Cache {
@@ -24,116 +79,104 @@ impl Cache {
             next_option = list.pagination.next_link;
         }
 
-        let packages = communities
+        let packages = futures::future::join_all(communities.into_iter().map(|comm| async move {
+            reqwest::get(format!("https://thunderstore.io/c/{comm}/api/v1/package/"))
+                .await?
+                .json::<Vec<TSPackage>>()
+                .await
+        }))
+        .await;
+
+        let packages: HashMap<_, _> = packages
             .into_iter()
-            .map(|comm| async move {
-                reqwest::get(format!("https://thunderstore.io/c/{comm}/api/v1/package/"))
-                    .await?
-                    .json::<Vec<TSPackage>>()
-                    .await
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .map(|p| {
+                (
+                    PackageKey::try_from(p.full_name.clone()).unwrap(),
+                    NugetPackage::from(p),
+                )
             })
-            .collect::<futures::stream::FuturesUnordered<_>>()
-            .collect::<Vec<Result<Vec<TSPackage>, reqwest::Error>>>()
-            .await;
+            .collect();
 
-        if packages.iter().any(|res| res.is_err()) {
-            return Err(packages
-                .into_iter()
-                .find(|res| res.is_err())
-                .unwrap()
-                .err()
-                .unwrap());
-        }
+        let all_package_string = serde_json::to_string(&SearchResult {
+            totalHits: packages.len(),
+            data: packages.values().map(|p| p.into()).collect(),
+        })
+        .unwrap();
 
-        cache
-            .write()
-            .await
-            .replace_with(packages.into_iter().flat_map(|res| res.unwrap()).collect());
+        let mut cache = cache.write().await;
+
+        cache.packages = packages;
+        cache.all_packages = all_package_string.into();
 
         Ok(())
-    }
-
-    fn replace_with(&mut self, ts_packages: Vec<TSPackage>) {
-        self.packages.clear();
-
-        self.packages.shrink_to(ts_packages.len());
-
-        for package in ts_packages {
-            if !self.packages.contains_key(&package.full_name) {
-                self.packages
-                    .insert(package.full_name.clone().to_lowercase(), package.into());
-            }
-        }
-
-        self.all_packages = Some(
-            serde_json::to_string(&SearchResult {
-                totalHits: self.packages.len(),
-                data: self.packages.values().map(|p| p.into()).collect(),
-            })
-            .unwrap(),
-        );
     }
 
     pub async fn enable_auto_update(cache: Arc<RwLock<Cache>>, timeout: Duration) {
         let mut s = cache.write().await;
 
-        Cache::disable_auto_update(&mut s);
-
-        let arc = cache.clone();
+        if s.auto_update.is_some() {
+            return;
+        }
         let token = Arc::new(CancellationToken::new());
-        let thread_token = token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(timeout).await;
-                if thread_token.is_cancelled() {
-                    return;
-                }
+        s.auto_update = Some(token.clone());
+        s.cache_duration = Some(timeout);
 
-                match Cache::cache(&arc).await {
-                    Ok(_) => (),
-                    Err(err) => eprintln!("Unexpected error while updating cache! {err:?}"),
+        drop(s);
+
+        tokio::spawn(async move {
+            let cancel_future = token.cancelled().fuse();
+            pin_mut!(cancel_future);
+            loop {
+                futures::select_biased! {
+                    _ = cancel_future => return,
+                    _ = tokio::time::sleep(timeout).fuse() => match Cache::cache(&cache).await {
+                        Ok(_) => (),
+                        Err(err) => eprintln!("Unexpected error while updating cache! {err:?}"),
+                    },
                 }
             }
         });
-
-        s.auto_update = Some(token);
     }
 
+    #[allow(dead_code)]
     pub fn disable_auto_update(cache: &mut Cache) {
-        let update = match &cache.auto_update {
-            Some(x) => x,
-            None => return,
-        };
-
-        update.cancel();
-
-        cache.auto_update = None;
+        if let Some(token) = cache.auto_update.take() {
+            token.cancel();
+        }
     }
 
     pub fn search(&self, q: SearchQuery) -> SearchResult {
-        let results = self.packages.values().map(|x| x.into());
+        let mut results: &mut dyn Iterator<Item = &NugetPackage> = &mut self.packages.values();
 
-        let mut final_vec: Vec<_> = match q.query {
-            Some(param) => {
-                let lowercase = param.to_lowercase();
-                results
-                    .filter(|x: &SearchItem| x.id.to_lowercase().contains(&lowercase))
-                    .collect()
-            }
-            None => results.collect(),
-        };
+        let mut search_results;
+        let mut skip_results;
+        let mut take_results;
+
+        if let Some(query) = q.query {
+            let lowercase = query.to_lowercase();
+            search_results =
+                results.filter(move |x| x.items[0].full_name_lower.contains(&lowercase));
+            results = &mut search_results;
+        }
 
         if let Some(skip) = q.skip {
-            final_vec = final_vec.into_iter().skip(skip).collect();
+            skip_results = results.skip(skip);
+            results = &mut skip_results;
         }
 
         if let Some(take) = q.take {
-            final_vec = final_vec.into_iter().take(take).collect();
+            take_results = results.take(take);
+            results = &mut take_results;
         }
 
+        let v: Vec<_> = results.map(|x| x.into()).collect();
+
         SearchResult {
-            totalHits: final_vec.len(),
-            data: final_vec,
+            totalHits: v.len(),
+            data: v,
         }
     }
 }
@@ -166,7 +209,6 @@ pub struct TSCommunityList {
 pub struct TSPackage {
     pub full_name: String,
     pub package_url: String,
-    pub date_updated: String,
     pub is_deprecated: bool,
     pub versions: Vec<TSVersion>,
 }
@@ -180,7 +222,6 @@ pub struct TSVersion {
     pub downloads: u32,
     pub date_created: String,
     pub website_url: String,
-    pub file_size: u64,
     pub dependencies: Vec<String>,
 }
 
@@ -189,7 +230,7 @@ pub struct NugetPackage {
     #[serde(rename = "@id")]
     pub id: String,
     #[serde(rename = "@type")]
-    pub res_type: [String; 3],
+    pub res_type: [&'static str; 3],
     pub count: u8,
     pub items: [NugetPackageInner; 1],
 }
@@ -200,6 +241,8 @@ pub struct NugetPackageInner {
     pub id: String,
     #[serde(skip)]
     pub full_name: String,
+    #[serde(skip)]
+    pub full_name_lower: String,
     pub count: usize,
     pub lower: String,
     pub upper: String,
@@ -215,15 +258,25 @@ pub struct NugetVersion {
     pub catalogEntry: NugetVersionInner,
 }
 
+#[derive(Serialize, Clone)]
+pub struct Deprecation {
+    #[serde(rename = "@id")]
+    pub id: String,
+    pub message: &'static str,
+    pub reasons: [&'static str; 1],
+}
+
 #[allow(non_snake_case)]
 #[derive(Serialize, Clone)]
 pub struct NugetVersionInner {
+    #[serde(rename = "@id")]
     pub id: String,
     pub description: String,
     pub iconUrl: String,
     pub published: String,
     pub version: String,
     pub packageContent: String,
+    pub deprecation: Option<Deprecation>,
     #[serde(skip)]
     pub downloads: u32,
     #[serde(skip)]
@@ -233,23 +286,24 @@ pub struct NugetVersionInner {
 impl From<TSPackage> for NugetPackage {
     fn from(pkg: TSPackage) -> Self {
         let base_url = crate::BASE_URL.get().unwrap();
+        let full_name_lower = pkg.full_name.to_lowercase();
         let url = format!(
             "{}/nuget/v3/package/{}/index.json",
-            base_url,
-            pkg.full_name.to_lowercase()
+            base_url, full_name_lower
         );
 
         NugetPackage {
             id: url.clone(),
             res_type: [
-                "PackageRegistration".to_string(),
-                "catalog:CatalogRoot".to_string(),
-                "catalog:Permalink".to_string(),
+                "PackageRegistration",
+                "catalog:CatalogRoot",
+                "catalog:Permalink",
             ],
             count: 1,
             items: [NugetPackageInner {
                 id: url.clone(),
                 full_name: pkg.full_name.clone(),
+                full_name_lower: full_name_lower.clone(),
                 count: pkg.versions.len(),
                 lower: pkg.versions.last().unwrap().version_number.clone(),
                 upper: pkg.versions.first().unwrap().version_number.clone(),
@@ -261,32 +315,40 @@ impl From<TSPackage> for NugetPackage {
                         packageContent: format!(
                             "{}/nuget/v3/base/{}/{}/{}.{}.nupkg",
                             base_url,
-                            pkg.full_name.to_lowercase(),
+                            full_name_lower,
                             version.version_number,
-                            pkg.full_name.to_lowercase(),
+                            full_name_lower,
                             version.version_number
                         ),
                         catalogEntry: NugetVersionInner {
                             id: pkg.full_name.clone(),
-                            description: [format!("{}\n\nDepends on:", version.description)]
-                                .iter()
-                                .chain(&version.dependencies)
-                                .map(|x| x.as_str())
-                                .collect::<Vec<&str>>()
-                                .join("\n"),
+                            description: [&format!(
+                                "{}\n\nPackage URL: {}\nWebsite URL: {}\nDepends on:",
+                                version.description, pkg.package_url, version.website_url
+                            )]
+                            .into_iter()
+                            .chain(&version.dependencies)
+                            .map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                             iconUrl: version.icon,
                             published: version.date_created,
                             packageContent: format!(
                                 "{}/nuget/v3/base/{}/{}/{}.{}.nupkg",
                                 base_url,
-                                pkg.full_name.to_lowercase(),
+                                full_name_lower,
                                 version.version_number,
-                                pkg.full_name.to_lowercase(),
+                                full_name_lower,
                                 version.version_number
                             ),
                             version: version.version_number,
                             downloads: version.downloads,
                             download_url: version.download_url,
+                            deprecation: pkg.is_deprecated.then(|| Deprecation {
+                                id: format!("{url}#deprecation"),
+                                message: "Deprecated on Thunderstore",
+                                reasons: ["Other"],
+                            }),
                         },
                     })
                     .collect(),
@@ -341,7 +403,7 @@ pub struct SearchVersion {
 impl From<&NugetVersion> for SearchVersion {
     fn from(ver: &NugetVersion) -> Self {
         Self {
-            id: "".to_string(),
+            id: format!("{}#{}", ver.id, ver.catalogEntry.version),
             version: ver.catalogEntry.version.clone(),
             downloads: ver.catalogEntry.downloads,
         }

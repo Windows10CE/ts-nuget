@@ -1,16 +1,15 @@
-use axum::body::StreamBody;
-use axum::response::IntoResponse;
+use axum::body::Body;
 use std::{
-    io::{Read, Write},
-    path::{self, Path, PathBuf},
+    io::Write,
+    path::{Path, PathBuf},
 };
 
+use crate::metadata::NugetVersion;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
-use zip::{write::FileOptions, ZipArchive, ZipWriter};
-
-use crate::metadata::NugetVersion;
+use zip::write::SimpleFileOptions;
+use zip::{ZipArchive, ZipWriter};
 
 pub struct Nupkg {
     path: PathBuf,
@@ -19,7 +18,7 @@ pub struct Nupkg {
 impl Nupkg {
     pub async fn get_for_pkg(pkg: &NugetVersion) -> Result<Self, reqwest::Error> {
         let name = format!("{}.{}", pkg.catalogEntry.id, pkg.catalogEntry.version);
-        let init_path = path::Path::new("nupkgs");
+        let init_path = Path::new("nupkgs");
         let path = init_path.join(name.clone() + ".nupkg");
         let zip_path = init_path.join(name + ".zip");
 
@@ -33,6 +32,7 @@ impl Nupkg {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(&zip_path)
                 .await
                 .unwrap();
@@ -44,6 +44,7 @@ impl Nupkg {
                     .read(true)
                     .write(true)
                     .create(true)
+                    .truncate(true)
                     .open(&path)
                     .unwrap(),
             );
@@ -54,35 +55,30 @@ impl Nupkg {
                 .collect();
             for file in names {
                 nuget
-                    .start_file(
+                    .start_file_from_path(
                         Path::new("lib")
                             .join("netstandard2.0")
-                            .join(Path::new(&file).file_name().unwrap())
-                            .to_string_lossy(),
-                        FileOptions::default(),
+                            .join(Path::new(&file).file_name().unwrap()),
+                        SimpleFileOptions::default(),
                     )
                     .unwrap();
                 let mut inner_file = zip.by_name(&file).unwrap();
-                let mut bytes: Vec<u8> = Vec::with_capacity(inner_file.size() as _);
-                inner_file.read_to_end(&mut bytes).unwrap();
-                nuget.write_all(&bytes).unwrap();
+                std::io::copy(&mut inner_file, &mut nuget).unwrap();
             }
 
             nuget
                 .start_file(
                     format!("{}.nuspec", pkg.catalogEntry.id),
-                    FileOptions::default(),
+                    SimpleFileOptions::default(),
                 )
                 .unwrap();
-            nuget
-                .write_all(
-                    format!(
-                        include_str!("template.nuspec"),
-                        pkg.catalogEntry.id, pkg.catalogEntry.version, pkg.catalogEntry.description
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
+
+            write!(
+                nuget,
+                include_str!("template.nuspec"),
+                pkg.catalogEntry.id, pkg.catalogEntry.version, pkg.catalogEntry.description
+            )
+            .unwrap();
 
             drop(zip);
             tokio::fs::remove_file(zip_path).await.unwrap();
@@ -91,7 +87,7 @@ impl Nupkg {
         Ok(Self { path })
     }
 
-    pub async fn get_body(&self) -> impl IntoResponse {
-        StreamBody::new(ReaderStream::new(File::open(&self.path).await.unwrap()))
+    pub async fn get_body(&self) -> Body {
+        Body::from_stream(ReaderStream::new(File::open(&self.path).await.unwrap()))
     }
 }
